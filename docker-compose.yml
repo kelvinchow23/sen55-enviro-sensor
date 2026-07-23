@@ -1,0 +1,7 @@
+services:
+  sen55:
+    build: .
+    container_name: sen55
+    devices:
+      - /dev/i2c-1:/dev/i2c-1
+    restart: unless-stopped
