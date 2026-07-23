@@ -4,4 +4,21 @@ services:
     container_name: sen55
     devices:
       - /dev/i2c-1:/dev/i2c-1
+    # I2C access works because the container runs as root (no USER in the
+    # Dockerfile). If you later add a non-root USER for hardening, root no
+    # longer masks device permissions -- pin access to the i2c group instead:
+    #   group_add:
+    #     - "<gid of i2c on the Pi: `getent group i2c | cut -d: -f3`>"
+    ports:
+      - "8000:8000"          # API reachable at http://<pi-tailscale-name>:8000
+    volumes:
+      - sen55-data:/data     # SQLite DB survives rebuilds / reboots
+    environment:
+      SAMPLE_INTERVAL_S: "5" # seconds between samples
+      RETENTION_DAYS: "30"   # rows older than this are pruned (0 = keep all)
+      DB_PATH: "/data/readings.db"
+      I2C_BUS: "1"
     restart: unless-stopped
+
+volumes:
+  sen55-data:

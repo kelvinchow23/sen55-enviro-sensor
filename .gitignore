@@ -1,9 +1,5 @@
-docs/
-.git/
-README.md
 __pycache__/
 *.pyc
 *.db
 *.db-wal
 *.db-shm
-.gitignore
