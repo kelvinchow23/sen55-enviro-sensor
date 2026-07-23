@@ -22,6 +22,16 @@ from sen55 import SEN5x
 
 log = logging.getLogger("sampler")
 
+# Number of consecutive read failures before we tear down and re-init the
+# sensor. A single failure (e.g. the first poll landing before warm-up, or a
+# one-off bus glitch) is tolerated without a disruptive reset/start cycle.
+REINIT_AFTER_READ_ERRORS = 5
+
+# Seconds to wait after start() before the first measurement read. The SEN5x
+# needs the fan/laser to spin up and a first measurement to complete (~1 s per
+# the datasheet); reading before then returns an I2C I/O error.
+WARMUP_AFTER_START_S = 2.0
+
 
 def _utc_now_iso() -> str:
     # Second resolution is plenty for a multi-second sample interval, and keeps
@@ -111,6 +121,7 @@ class Sampler:
         interval = max(1.0, config.SAMPLE_INTERVAL_S)
         sen = None
         sample_count = 0
+        read_errors = 0  # consecutive read failures on the current handle
 
         while not self._stop.is_set():
             cycle_start = time.monotonic()
@@ -123,6 +134,7 @@ class Sampler:
                     self._record_error("sensor init failed")
                     self._interruptible_sleep(self._backoff(interval))
                     continue
+                read_errors = 0
 
             try:
                 if sen.data_ready():
@@ -132,25 +144,38 @@ class Sampler:
                         _utc_now_iso(), values, status_ok, status_raw
                     )
                     self._record_success(status_ok, status_raw)
+                    read_errors = 0
                     sample_count += 1
                     if (config.RETENTION_DAYS > 0 and sample_count
                             % config.PRUNE_EVERY_N_SAMPLES == 0):
                         self._prune()
-                # else: not ready yet this tick -- wait for the next cycle.
+                else:
+                    # Sensor answered but has no new measurement yet (normal
+                    # right after start() and between the ~1 Hz update cadence).
+                    # A clean not-ready is not an error -- clear the counter.
+                    read_errors = 0
             except Exception as e:
-                # CRC mismatch / I2C error: log, skip this sample, and drop the
-                # sensor handle so we re-init (recovers from a bus glitch).
+                # data_ready()/read() I2C glitch or CRC mismatch. Do NOT tear
+                # the sensor down on a single failure -- that caused a
+                # reset/start churn loop when the very first read fired before
+                # the sensor was warmed up. Only re-init after several
+                # consecutive failures, which indicates a real bus/device fault
+                # rather than a transient hiccup.
+                read_errors += 1
                 self._record_error(f"{type(e).__name__}: {e}")
-                log.warning("read failed, skipping sample: %s", e)
-                try:
-                    sen.close()
-                except Exception:
-                    pass
-                sen = None
-                # Persistent fault -> back off so we don't churn reset/start on
-                # the bus every interval; transient glitch recovers immediately.
-                self._interruptible_sleep(self._backoff(interval))
-                continue
+                log.warning("read failed (%d in a row), skipping sample: %s",
+                            read_errors, e)
+                if read_errors >= REINIT_AFTER_READ_ERRORS:
+                    log.warning("re-initializing sensor after %d read errors",
+                                read_errors)
+                    try:
+                        sen.close()
+                    except Exception:
+                        pass
+                    sen = None
+                    read_errors = 0
+                    self._interruptible_sleep(self._backoff(interval))
+                    continue
 
             # Sleep the remainder of the interval (never negative).
             elapsed = time.monotonic() - cycle_start
@@ -188,6 +213,9 @@ class Sampler:
             except Exception as e:
                 log.warning("could not read device identity: %s", e)
             sen.start()
+            # Let the fan/laser spin up and the first measurement complete
+            # before the loop attempts a read (avoids an immediate I/O error).
+            self._interruptible_sleep(WARMUP_AFTER_START_S)
             log.info("sensor started: %s", self.device)
             return sen
         except Exception as e:
